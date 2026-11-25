@@ -12,6 +12,7 @@ const OPPOSITE = { left: 'right', right: 'left', up: 'down', down: 'up' };
 
 const PACMAN_SPEED = 0.125; // 1/8 celda/frame -> alinea cada 8 frames
 const GHOST_SPEED = 0.1;    // 1/10 celda/frame
+const FLEE_RANGE = 2; // distancia en celdas a partir de la cual el fugitivo huye / el emboscador persigue
 
 // Crea una partida nueva. Copia MAZE (pristino) a game.grid para poder comer
 // dots sin destruir el original, y reiniciar.
@@ -42,6 +43,9 @@ function createGame() {
       dir: 'up',
       speed: GHOST_SPEED,
       kind: g.kind,
+      delay: g.delay || 0,
+      frames: 0,
+      released: false,
     } ) ),
   };
 }
@@ -110,6 +114,58 @@ function movePacman( game ) {
   wrapTunnel( p, width );
 }
 
+// Busqueda en anchura (BFS): direccion del primer paso desde (gx,gy) hacia (px,py).
+// Devuelve null si no hay ruta (cae al comportamiento aleatorio como fallback).
+function bfsNextDir( grid, gx, gy, px, py ) {
+  const H = grid.length;
+  const W = grid[ 0 ].length;
+  gx = Math.round( gx );
+  gy = Math.round( gy );
+  px = Math.round( px );
+  py = Math.round( py );
+  const startKey = gx + ',' + gy;
+  const targetKey = px + ',' + py;
+  const cameFrom = new Map();
+  const visited = new Set( [ startKey ] );
+  const queue = [ { x: gx, y: gy } ];
+  let target = null;
+  while ( queue.length ) {
+    const cur = queue.shift();
+    const key = cur.x + ',' + cur.y;
+    if ( key === targetKey ) { target = cur; break; }
+    for ( const dir of Object.keys( DIRS ) ) {
+      const d = DIRS[ dir ];
+      const nx = cur.x + d.x;
+      const ny = cur.y + d.y;
+      const nKey = nx + ',' + ny;
+      if ( visited.has( nKey ) ) continue;
+      if ( ny < 0 || ny >= H || nx < 0 || nx >= W ) continue;
+      if ( grid[ ny ][ nx ] === 1 ) continue; // pared
+      visited.add( nKey );
+      cameFrom.set( nKey, { x: cur.x, y: cur.y } );
+      queue.push( { x: nx, y: ny } );
+    }
+  }
+  if ( !target ) return null;
+  const moves = [];
+  let node = target;
+  while ( node.x !== gx || node.y !== gy ) {
+    const pk = cameFrom.get( node.x + ',' + node.y );
+    if ( !pk ) break;
+    const dx = node.x - pk.x;
+    const dy = node.y - pk.y;
+    let dir = null;
+    for ( const d of Object.keys( DIRS ) ) {
+      const dd = DIRS[ d ];
+      if ( dd.x === dx && dd.y === dy ) { dir = d; break; }
+    }
+    if ( !dir ) break;
+    moves.unshift( dir );
+    node = pk;
+  }
+  return moves.length ? moves[ 0 ] : null;
+}
+
 function decideGhost( game, g ) {
   const grid = game.grid;
   const p = game.pacman;
@@ -120,30 +176,64 @@ function decideGhost( game, g ) {
   // Sin salida (callejon): permitir el giro de 180.
   const choices = options.length ? options : [ '' + OPPOSITE[ g.dir ] ];
 
+  const px = Math.round( p.x );
+  const py = Math.round( p.y );
+
+  // Cazador: persigue agresivamente a Pacman via busqueda en anchura.
   if ( g.kind === 'hunter' ) {
-    const px = Math.round( p.x );
-    const py = Math.round( p.y );
+    const dir = bfsNextDir( grid, g.x, g.y, px, py );
+    if ( dir ) { g.dir = dir; return; }
+  }
+
+  // Emboscador: patrulla (aleatorio) hasta que Pacman esta cerca, luego persigue.
+  if ( g.kind === 'ambusher' && Math.abs( g.x - px ) + Math.abs( g.y - py ) <= FLEE_RANGE ) {
+    const dir = bfsNextDir( grid, g.x, g.y, px, py );
+    if ( dir ) { g.dir = dir; return; }
+  }
+
+  // Fugitivo: huye de Pacman cuando esta cerca; si no, patrulla aleatorio.
+  if ( g.kind === 'flee' && Math.abs( g.x - px ) + Math.abs( g.y - py ) <= FLEE_RANGE ) {
     let best = choices[ 0 ];
-    let bestDist = Infinity;
+    let bestDist = -1;
     for ( const dir of choices ) {
       const d = DIRS[ dir ];
-      const nx = g.x + d.x;
-      const ny = g.y + d.y;
-      const dist = Math.abs( nx - px ) + Math.abs( ny - py );
-      if ( dist < bestDist ) {
+      const dist = Math.abs( g.x + d.x - px ) + Math.abs( g.y + d.y - py );
+      if ( dist > bestDist ) {
         bestDist = dist;
         best = dir;
       }
     }
     g.dir = best;
-  } else {
-    g.dir = choices[ Math.floor( Math.random() * choices.length ) ];
+    return;
   }
+
+  // Flanqueador: se posiciona relativo a Pacman; al llegar al flanco, persigue.
+  if ( g.kind === 'flanker' ) {
+    const pdir = p.dir || 'left';
+    const pd = DIRS[ pdir ];
+    const fx = px - ( pd ? pd.y : 0 );
+    const fy = py + ( pd ? pd.x : -1 );
+    const atFlank = Math.abs( g.x - fx ) < 0.5 && Math.abs( g.y - fy ) < 0.5;
+    const tx = atFlank ? px : fx;
+    const ty = atFlank ? py : fy;
+    const dir = bfsNextDir( grid, g.x, g.y, tx, ty );
+    if ( dir ) { g.dir = dir; return; }
+  }
+
+  // Comportamiento por defecto: aleatorio entre movimientos legales.
+  g.dir = choices[ Math.floor( Math.random() * choices.length ) ];
 }
 
 function moveGhost( game, g ) {
   const grid = game.grid;
   const width = grid[ 0 ].length;
+
+  // Fantasmas con delay: permanecen en el pen hasta que frames >= delay.
+  if ( !g.released ) {
+    g.frames++;
+    if ( g.frames < g.delay ) return;
+    g.released = true;
+  }
 
   if ( aligned( g.x ) && aligned( g.y ) ) {
     g.x = Math.round( g.x );
@@ -168,6 +258,9 @@ function resetPositions( game ) {
     g.x = GHOST_STARTS[ i ].x;
     g.y = GHOST_STARTS[ i ].y;
     g.dir = 'up';
+    g.delay = GHOST_STARTS[ i ].delay || 0;
+    g.frames = 0;
+    g.released = false;
   } );
 }
 
